@@ -2,6 +2,7 @@
   "package": "com.mipay.wallet",
   "serial": "",
   "device_wait_seconds": 120,
+  "humanize": true,
   "network_check": true,
   "network_retries": 3,
   "network_settle": 25,

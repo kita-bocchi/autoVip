@@ -8,11 +8,11 @@
 一句话原理：**脚本不在手机上跑，手机只是执行终端**。电脑负责调度、判断、重试、取证。
 
 ```
-07:00  计划任务（Windows）
+07:00 + 0~60min 随机  计划任务（Windows）
          │  wallet_daily.py
          ├─ adb 连手机 → 点亮 → 解锁 → 屏幕常亮
          ├─ 回桌面点「钱包玩家视界」小组件（找不到就回退 App 内入口）
-         ├─ 阶段一：活动页大按钮「看10秒」→ 跳广告 → 等 14s → 切回 → 开宝箱
+         ├─ 阶段一：活动页大按钮「看10秒」→ 跳广告 → 停留 16~26s（随机）→ 切回 → 开宝箱
          ├─ 阶段二：打开任务面板，做完剩余看广告任务
          ├─ 阶段三：试用任务（下载 → 安装 → 试用 30s → 领奖）
          └─ 校验 → 写 state.json → 截图 + 可选推送
@@ -152,7 +152,8 @@ run.bat --force
 setup_task.bat
 ```
 
-注册任务 `XiaomiWalletDaily`，每天 07:00 用 `pythonw.exe` 静默执行。
+注册任务 `XiaomiWalletDaily`，每天 07:00 之后随机延迟最多 60 分钟启动，用 `pythonw.exe` 静默执行。
+脚本本身不睡觉，延迟由任务计划程序的 `RandomDelay` 完成——固定的 07:00:00 准点触发是最明显的时间指纹。
 
 **注意：`schtasks` 注册出来是「就绪」可直接跑；如果任务被停用过，需要显式启用：**
 
@@ -161,13 +162,16 @@ Enable-ScheduledTask -TaskName "XiaomiWalletDaily"
 Start-ScheduledTask  -TaskName "XiaomiWalletDaily"   # 立刻跑一次验证
 ```
 
-想改执行时间（例如改成 07:00）：
+想改执行时间（例如改成 06:30）：
 
 ```powershell
-Set-ScheduledTask -TaskName "XiaomiWalletDaily" -Trigger (New-ScheduledTaskTrigger -Daily -At 07:00)
+$t = Get-ScheduledTask -TaskName "XiaomiWalletDaily"
+$t.Triggers[0].StartBoundary = "2026-01-01T06:30:00"
+$t.Triggers[0].RandomDelay   = "PT60M"      # 随机延迟 0~60 分钟，可去掉
+Set-ScheduledTask -TaskName "XiaomiWalletDaily" -Trigger $t.Triggers[0]
 ```
 
-改完用 `Get-ScheduledTaskInfo` 确认 `NextRunTime`。
+改完用 `Get-ScheduledTaskInfo` 确认 `NextRunTime`（带随机延迟时它会落在整点之后的随机分钟）。
 
 建议在「任务计划程序」里再改两处：勾「不管用户是否登录都要运行」、勾「使用最高权限运行」。
 （`schtasks.exe` 在本机曾被安全软件拦截，改用 PowerShell 的 `Set-ScheduledTask` 更稳。）
@@ -221,7 +225,8 @@ ping 223.5.5.5 / 119.29.29.29 / www.baidu.com（任一回包即算在线）
 找大按钮（含"秒" + 宽度 > 60% 屏宽）
   → 点它
   → 判断落点：第三方 App / 站内「活动指南」页 / 应用商店
-  → 等 14 秒（客户端从跳转瞬间开始计时，不用等广告播完）
+  → 停留 `page_watch_seconds` × 1.15~1.90 秒（默认基准 14s，实际 16~26s 随机；
+     客户端从跳转瞬间开始计时，不用等广告播完）
   → 切回钱包 → 关掉「桌面入口访问」涂层
   → 点宝箱（Canvas 绘制，无文字节点，按坐标点）→ 「恭喜获得」出现即成功
   → 关奖励弹窗 → 关任务面板 → 找下一条
@@ -309,6 +314,7 @@ state.json                    # {"last_success": "<日期>", ...}
 | `success_keywords` | 已领取/明日再来/明天再来 | 界面命中即判成功 |
 | `max_retry` | 2 | 整轮重试次数，**别调大**（风控特征） |
 | `skip_if_done` | true | 当天成功过就跳过 |
+| `humanize` | true | 等待随机化 + 点击高斯抖动。设为 false 则所有等待和坐标恢复固定值，只用于调试复现 |
 | `notify_webhook` | `""` | 企业微信机器人 / Server酱 / pushplus，留空不推送 |
 | `panel_debug` | true | 日志里打印面板按钮列表，排错时很有用 |
 
@@ -330,6 +336,26 @@ state.json                    # {"last_success": "<日期>", ...}
 
 `optional` **默认 true（可跳过）**，只有显式写 `"optional": false` 的步骤失败才会终止整轮。
 当前只有 `ad_tasks` 是 `false`。
+
+---
+
+## 行为拟人化（`humanize`）
+
+自动化行为里有几类特征是可以被统计出来的，本项目默认把它们打散：
+
+| 特征 | 原实现 | 现在 |
+|---|---|---|
+| **时间点** | 每天 07:00:00 准点启动 | 任务计划程序 `RandomDelay=PT60M`，07:00~08:00 之间任意时刻 |
+| **操作间隔** | `time.sleep(固定值)`，整轮耗时精确到秒 | `nap()`：基准 × 0.90~1.50 随机，整轮时长变成浮动的 4~8 分钟 |
+| **观看时长** | 每条广告恰好停 14.0 秒 | `ad_dwell()`：14s × 1.15~1.90，实际 16~26 秒 |
+| **点击位置** | `±3px` 均匀抖动（1080 屏上 0.28%） | 高斯分布，σ≈10px，最大 ±21px；真人点击也是聚在中心、偶尔偏一点 |
+| **滑动手势** | 永远 300ms 的匀速直线 | 时长 × 0.75~1.45，起止点 ±9px |
+
+调试时把 `humanize` 设为 `false`，等待与坐标全部恢复固定值，方便复现问题。
+
+**改不掉的部分要清楚**：手机上常驻的 `atx-agent`、root 权限、以及 `input tap` 注入事件本身
+（`deviceId=-1`、压力恒为 1.0）。任何做了基础检测的 App 都能识别"这台设备上有自动化框架"。
+`humanize` 打散的是**行为特征**，不是**环境特征**。所以：别用主账号跑。
 
 ---
 

@@ -51,6 +51,34 @@ def log(msg: str) -> None:
             pass
 
 
+# 行为拟人开关：关掉后所有等待与点击恢复成固定值（调试复现用）
+HUMANIZE = True
+
+
+def nap(sec: float, lo: float = 0.90, hi: float = 1.50) -> None:
+    """带随机分布的等待。
+
+    脚本原先每步都是 time.sleep(固定值)，整轮耗时精确到秒（两次回归都是 2m47s），
+    这是行为分析最容易抓的指纹之一：真人的操作间隔一定有方差。
+    默认在基准的 0.90~1.50 倍之间取值（均值约 1.2 倍，整轮会慢 20% 左右）。
+    """
+    if not HUMANIZE:
+        time.sleep(sec)
+        return
+    time.sleep(max(0.05, sec * random.uniform(lo, hi)))
+
+
+def ad_dwell(sec: float) -> float:
+    """广告/站内浏览的实际停留时长：只在基准上往长了随机，不会短于要求。
+
+    平台要求看满 10 秒，所以下限必须大于基准；上限给到 1.9 倍是让
+    "每次都恰好停留 14.0 秒" 这种规律消失。
+    """
+    if not HUMANIZE:
+        return sec
+    return sec * random.uniform(1.15, 1.90)
+
+
 def init_dirs() -> None:
     global _log_fp
     LOG_DIR.mkdir(exist_ok=True)
@@ -68,6 +96,7 @@ def load_config() -> dict:
     cfg.setdefault("notify_webhook", "")
     cfg.setdefault("success_keywords", [])
     cfg.setdefault("steps", [])
+    cfg.setdefault("humanize", True)
     return cfg
 
 
@@ -146,14 +175,14 @@ class WalletBot:
                 log("设备未就绪，重启 adb 服务后继续等待...")
                 try:
                     adb("kill-server")
-                    time.sleep(2)
+                    nap(2)
                     adb("start-server")
                 except Exception as exc:
                     log("重启 adb 服务失败: {}".format(exc))
                 restarted = True
             log("等待设备上线，剩余 {:.0f}s（当前: {}）".format(
                 left, last or "无设备"))
-            time.sleep(5)
+            nap(5)
 
     def preflight(self) -> str:
         """检查 adb 与设备状态，返回可用序列号"""
@@ -238,16 +267,40 @@ class WalletBot:
         if "Exception" in out or "Error" in out:
             log("  注入异常: {}".format(out.strip().splitlines()[0][:160]))
 
-    def tap(self, x: float, y: float, jitter: int = 3) -> None:
-        x += random.randint(-jitter, jitter)
-        y += random.randint(-jitter, jitter)
-        x = max(2, min(self.width - 2, int(x)))
-        y = max(2, min(self.height - 2, int(y)))
+    def tap(self, x: float, y: float, jitter: int | None = None) -> None:
+        """点一下。
+
+        原来的抖动是 random.randint(-3, 3)，在 1080 宽的屏上只有 ±0.28%，
+        等于每次都点在同一处——真手指同一点的离散度远大于此。
+        现在默认按高斯分布散开（σ ≈ 1% 短边，约 11px，最大 ±2 倍 σ），
+        真人点击也是集中在中心、少数偏一点，而不是均匀分布。
+        显式传 jitter（含 0）时仍按原来的均匀抖动，供配置里的精确坐标步骤使用。
+        """
+        if not HUMANIZE:
+            self._input("tap", str(int(x)), str(int(y)))
+            return
+        if jitter is not None:
+            dx = random.randint(-jitter, jitter)
+            dy = random.randint(-jitter, jitter)
+        else:
+            sd = max(4.0, min(self.width, self.height) * 0.010)
+            cap = sd * 2
+            dx = int(max(-cap, min(cap, random.gauss(0, sd))))
+            dy = int(max(-cap, min(cap, random.gauss(0, sd))))
+        x = max(2, min(self.width - 2, int(x + dx)))
+        y = max(2, min(self.height - 2, int(y + dy)))
         self._input("tap", str(x), str(y))
 
     def swipe(self, x1: float, y1: float, x2: float, y2: float, ms: int = 300) -> None:
+        """滑动。时长与起止点都加随机，避免「永远 300ms 的完美直线」。"""
+        if HUMANIZE:
+            ms = int(ms * random.uniform(0.75, 1.45))
+            x1 += random.randint(-9, 9)
+            y1 += random.randint(-9, 9)
+            x2 += random.randint(-9, 9)
+            y2 += random.randint(-9, 9)
         self._input("swipe", str(int(x1)), str(int(y1)),
-                    str(int(x2)), str(int(y2)), str(int(ms)))
+                    str(int(x2)), str(int(y2)), str(max(80, int(ms))))
 
     def key(self, code: str) -> None:
         self._input("keyevent", code)
@@ -273,7 +326,7 @@ class WalletBot:
                 return True
             log("  前台已跳到外部页面（{}），按返回键撤回".format(pkg))
             self.key("4")
-            time.sleep(1.8)
+            nap(1.8)
         pkg = self.current_package()
         ok = (not pkg) or pkg.startswith(guard)
         if not ok:
@@ -296,15 +349,15 @@ class WalletBot:
         if not screen_on:
             log("屏幕熄灭，点亮")
             self.key("224")  # KEYCODE_WAKEUP
-            time.sleep(1.5)
+            nap(1.5)
         # 无密码设备用系统命令直接解散锁屏，比上滑稳
         shell_root("wm dismiss-keyguard")
-        time.sleep(1.0)
+        nap(1.0)
         if "Keyguard" in self.current_focus():
             log("仍在锁屏，尝试上滑")
             self.swipe(self.width * 0.5, self.height * 0.85,
                        self.width * 0.5, self.height * 0.35, 300)
-            time.sleep(1.2)
+            nap(1.2)
 
     # ---------- 网络 ----------
     # 手机断网时活动页只会白屏，脚本会照常点 6 分钟然后报"未检测到成功标识"，
@@ -325,13 +378,13 @@ class WalletBot:
         """关掉再打开 WiFi。用 root 转发，普通 shell 改不了 WiFi 状态"""
         log("  关闭 WiFi")
         shell_root("svc wifi disable")
-        time.sleep(3.0)
+        nap(3.0)
         log("  重新打开 WiFi")
         out = shell_root("svc wifi enable")
         if "Error" in out or "Exception" in out:
             # Android 12+ 上 svc 有时被弃用，退回 cmd wifi
             shell_root("cmd wifi set-wifi-enabled enabled")
-        time.sleep(2.0)
+        nap(2.0)
 
     def ensure_network(self, retries: int = 3, settle: float = 25.0) -> bool:
         """确认手机能上网；断网则重启 WiFi，最多重试 retries 轮
@@ -358,7 +411,7 @@ class WalletBot:
 
             deadline = time.time() + max(5.0, settle)
             while time.time() < deadline:
-                time.sleep(3.0)
+                nap(3.0)
                 if self.phone_online():
                     log("  网络已恢复（第 {} 轮重试成功）".format(i))
                     self.net_ok = True
@@ -430,10 +483,10 @@ class WalletBot:
         for _ in range(2):
             self.swipe(self.width * 0.5, self.height * 0.75,
                        self.width * 0.5, self.height * 0.42, 150)
-            time.sleep(0.3)
+            nap(0.3)
             self.swipe(self.width * 0.5, self.height * 0.42,
                        self.width * 0.5, self.height * 0.75, 150)
-            time.sleep(0.6)
+            nap(0.6)
             try:
                 if len(self.d.xpath('//*[@text!=""]').all()) >= 6:
                     return True
@@ -482,19 +535,19 @@ class WalletBot:
         for x, y in ((self.width * 0.907, self.height * 0.439),
                      (self.width * 0.907, self.height * 0.400)):
             self.tap(x, y)
-            time.sleep(1.2)
+            nap(1.2)
             if not self.panel_open():
                 log("  已关闭任务面板")
                 return True
         self.key("4")
-        time.sleep(1.2)
+        nap(1.2)
         return not self.panel_open()
 
     def scroll_to_top(self, times: int = 3) -> None:
         for _ in range(max(1, times)):
             self.swipe(self.width * 0.5, self.height * 0.32,
                        self.width * 0.5, self.height * 0.88, 300)
-            time.sleep(0.9)
+            nap(0.9)
 
     def open_task_panel(self) -> bool:
         if self.panel_open():
@@ -506,7 +559,7 @@ class WalletBot:
                     continue
                 log("  点「{}」打开任务面板".format(kw))
                 self.tap(hit[1], hit[2])
-                time.sleep(1.8)
+                nap(1.8)
                 self.dismiss_hint()
                 if self.panel_open():
                     return True
@@ -520,7 +573,7 @@ class WalletBot:
         for kw in ("知道了", "我知道了", "确定"):
             if self.click_any([kw], timeout=1.5):
                 log("  关闭提示弹窗: {}".format(kw))
-                time.sleep(1.0)
+                nap(1.0)
                 return
 
     def panel_top(self) -> int:
@@ -628,11 +681,11 @@ class WalletBot:
                 if hit:
                     log("  从首页进活动页: 「{}」".format(kw))
                     self.tap(hit[1], hit[2])
-                    time.sleep(3.0)
+                    nap(3.0)
                     break
             if self.on_activity_page():
                 return True
-            time.sleep(1.5)
+            nap(1.5)
         return self.on_activity_page()
 
     def close_reward_popup(self) -> bool:
@@ -643,7 +696,7 @@ class WalletBot:
             for fx, fy in ((0.500, 0.692), (0.500, 0.778),
                            (0.500, 0.798), (0.500, 0.860)):
                 self.tap(self.width * fx, self.height * fy)
-                time.sleep(1.4)
+                nap(1.4)
                 if not self.find_target("恭喜获得"):
                     log("  已关闭奖励弹窗")
                     return True
@@ -664,10 +717,10 @@ class WalletBot:
         # 所以给一组候选逐个试，点偏了也只是点在遮罩空白处，无副作用。
         for fy in (0.440, 0.464, 0.420, 0.485, 0.505):
             self.tap(self.width * 0.5, self.height * fy)
-            time.sleep(2.0)
+            nap(2.0)
             if self.find_target("恭喜获得"):
                 log("  宝箱已打开")
-                time.sleep(1.2)
+                nap(1.2)
                 self.close_reward_popup()
                 return True
         return False
@@ -684,7 +737,7 @@ class WalletBot:
             return False
         log("  主按钮是「点击领会员」，有奖励待领，点开")
         self.tap(hit[1], hit[2])
-        time.sleep(2.5)
+        nap(2.5)
         if self.open_treasure_box():
             log("  已补领待领取奖励")
             return True
@@ -696,7 +749,7 @@ class WalletBot:
             if self.find_target(kw):
                 log("  关闭桌面引导图层")
                 self.tap(self.width * 0.639, self.height * 0.784)
-                time.sleep(1.2)
+                nap(1.2)
                 return
 
     def enter_from_app(self) -> bool:
@@ -708,10 +761,10 @@ class WalletBot:
         shell("monkey -p {} -c android.intent.category.LAUNCHER 1".format(
             self.cfg["package"]))
         for _ in range(12):
-            time.sleep(1.0)
+            nap(1.0)
             if self.current_package().startswith(self.cfg["package"]):
                 break
-        time.sleep(3.5)
+        nap(3.5)
         self.dismiss_hint()
         if self.ensure_activity_page(timeout=12):
             log("  已从 App 内入口进入活动页")
@@ -729,16 +782,16 @@ class WalletBot:
         """
         if cold:
             shell("am force-stop {}".format(self.cfg["package"]))
-            time.sleep(2.5)
+            nap(2.5)
         self.key("3")
-        time.sleep(2.0)
+        nap(2.0)
         hit = self.find_target("钱包玩家视界")
         if not hit:
             # 组件在第二屏，往左翻页找
             for _ in range(3):
                 self.swipe(self.width * 0.9, self.height * 0.55,
                            self.width * 0.1, self.height * 0.55, 300)
-                time.sleep(1.8)
+                nap(1.8)
                 hit = self.find_target("钱包玩家视界")
                 if hit:
                     break
@@ -748,10 +801,10 @@ class WalletBot:
         log("  点桌面小组件 @({},{})".format(hit[1], hit[2]))
         self.tap(hit[1], hit[2])
         for _ in range(12):
-            time.sleep(1.0)
+            nap(1.0)
             if self.current_package().startswith(self.cfg["package"]):
                 break
-        time.sleep(3.5)
+        nap(3.5)
         self.scroll_to_top(4)
         return self.on_activity_page()
 
@@ -769,7 +822,7 @@ class WalletBot:
             self.wake()
             if i == 0:
                 self.scroll_to_top(times=2)
-            time.sleep(delay)
+            nap(delay)
             hit = self.find_ad_entry()
         return hit
 
@@ -798,37 +851,40 @@ class WalletBot:
             label, x, y = hit
             log("  第 {} 条: 点「{}」@({},{})".format(done + 1, label[:14], x, y))
             self.tap(x, y)
-            time.sleep(3.0)
+            nap(3.0)
 
             pkg = self.current_package()
             if pkg.startswith(self.cfg["package"]):
                 # 没跳出去：可能是「活动指南」这种站内引导页（浏览10秒就算完成），
                 # 也可能只是慢半拍，先给它一次机会
-                time.sleep(2.5)
+                nap(2.5)
                 pkg = self.current_package()
                 if pkg.startswith(self.cfg["package"]):
                     # 站内「活动指南」页刚跳过来时无障碍树常常还是空的，
                     # 单靠文字会漏判，所以再加一条：大按钮不见了 = 已经离开活动页
                     entry_left = self.find_ad_entry() is None
                     if self.on_guide_page() or entry_left:
-                        log("  进入站内「活动指南」页，停留 {}s 后返回".format(int(wait_s)))
-                        time.sleep(wait_s)
+                        dwell = ad_dwell(wait_s)
+                        log("  进入站内「活动指南」页，停留 {}s 后返回".format(int(dwell)))
+                        nap(dwell, 1.0, 1.0)
                         self.key("4")
-                        time.sleep(2.5)
+                        nap(2.5)
                     else:
                         log("  点击后没有跳转，本轮放弃")
                         self.shot("page_ad_no_jump")
                         break
                 else:
-                    log("  已跳转广告页: {}，等 {}s".format(pkg, int(wait_s)))
-                    time.sleep(wait_s)
+                    dwell = ad_dwell(wait_s)
+                    log("  已跳转广告页: {}，等 {}s".format(pkg, int(dwell)))
+                    nap(dwell, 1.0, 1.0)
                     self.bring_wallet_front()
-                    time.sleep(2.5)
+                    nap(2.5)
             else:
-                log("  已跳转广告页: {}，等 {}s".format(pkg, int(wait_s)))
-                time.sleep(wait_s)
+                dwell = ad_dwell(wait_s)
+                log("  已跳转广告页: {}，等 {}s".format(pkg, int(dwell)))
+                nap(dwell, 1.0, 1.0)
                 self.bring_wallet_front()
-                time.sleep(2.5)
+                nap(2.5)
             self.ensure_activity_page()
             self.dismiss_guide()
             if self.open_treasure_box():
@@ -841,7 +897,7 @@ class WalletBot:
             # 两者都会挡住下面的大按钮，不关掉就会误判「没有下一条广告」
             self.close_task_panel()
             self.dismiss_guide()
-            time.sleep(1.0)
+            nap(1.0)
             done += 1
         # 收尾：有可能最后一条的奖励还挂在「点击领会员」上
         self.dismiss_guide()
@@ -883,7 +939,7 @@ class WalletBot:
             label, x, y = hit
             log("  第 {} 轮: 点「{}」@({},{})".format(i, label, x, y))
             self.tap(x, y)
-            time.sleep(3.0)
+            nap(3.0)
             self.dismiss_hint()
 
             played = self.action_ad({"max_seconds": step.get("max_seconds", 100),
@@ -895,10 +951,10 @@ class WalletBot:
             self.escape_foreign()
 
             # 回到面板继续下一轮
-            time.sleep(1.0)
+            nap(1.0)
             if not self.panel_open():
                 self.key("4")
-                time.sleep(1.5)
+                nap(1.5)
                 if not self.open_task_panel():
                     log("  看完广告后回不到任务面板")
                     self.shot("panel_back_fail")
@@ -993,10 +1049,10 @@ class WalletBot:
         shell("monkey -p {} -c android.intent.category.LAUNCHER 1".format(
             self.cfg["package"]))
         for _ in range(10):
-            time.sleep(0.8)
+            nap(0.8)
             if self.current_package().startswith(
                     self.cfg["package"].rsplit(".", 1)[0]):
-                time.sleep(2.0)
+                nap(2.0)
                 return
         log("  切回钱包超时")
 
@@ -1018,13 +1074,13 @@ class WalletBot:
                 if hit:
                     break
             if not hit:
-                time.sleep(1.2)
+                nap(1.2)
                 continue
             kw, x, y = hit
             log("  试用 App 弹窗: 点「{}」@({},{})".format(kw, x, y))
             self.tap(x, y)
             taps += 1
-            time.sleep(2.0)
+            nap(2.0)
         return taps
 
     def trial_download(self, title: str, step: dict) -> bool:
@@ -1041,18 +1097,18 @@ class WalletBot:
         # 第一次点「去下载」会弹一个「任务说明」浮层，真正的下载按钮在里面，
         # 只点第一层什么都不会发生（这是最容易卡死的地方）
         for _ in range(3):
-            time.sleep(2.0)
+            nap(2.0)
             hit = self.find_target("立即下载")
             if not hit:
                 break
             log("  任务说明弹窗: 点「{}」@({},{})".format(*hit))
             self.tap(hit[1], hit[2])
-            time.sleep(1.5)
+            nap(1.5)
 
         start = time.time()
         last = ""
         while time.time() - start < timeout:
-            time.sleep(4.0)
+            nap(4.0)
             rows = self.panel_rows()
             row = self.find_row(rows, title)
             if not row:
@@ -1072,7 +1128,7 @@ class WalletBot:
                     if hit:
                         log("  安装确认弹窗: 点「{}」".format(kw))
                         self.tap(hit[1], hit[2])
-                        time.sleep(2.0)
+                        nap(2.0)
                         break
         log("  等待下载安装超时({}s)，最后状态: {}".format(int(timeout), last))
         self.shot("trial_download_timeout")
@@ -1081,10 +1137,10 @@ class WalletBot:
     def close_trial_hint(self) -> None:
         """关掉「今日试用已完成 / 明日再来」倒计时框"""
         if self.click_any(["关闭提醒我也能来", "关闭提醒", "暂不提醒"], timeout=2.0):
-            time.sleep(1.5)
+            nap(1.5)
             return
         self.tap(self.width * 0.5, self.height * 0.798)
-        time.sleep(1.5)
+        nap(1.5)
 
     def trial_launch_and_browse(self, title: str, step: dict) -> bool:
         """点「去试用」→ 处理弹窗 → 浏览 → 回钱包"""
@@ -1103,7 +1159,7 @@ class WalletBot:
         guard = self.cfg["package"].rsplit(".", 1)[0]
         got = False
         for _ in range(15):
-            time.sleep(1.0)
+            nap(1.0)
             # 「今日试用已完成」：今天的次数用完，弹倒计时框，不会再跳 App
             if self.find_target("今日试用已完成") or self.find_target("明日再来可领"):
                 log("  今天这一步试用已经做过了，关掉提示")
@@ -1117,7 +1173,7 @@ class WalletBot:
             log("  没跳到试用 App，放弃这一行")
             self.shot("trial_no_jump")
             return False
-        time.sleep(3.0)
+        nap(3.0)
         log("  已进入试用 App: {}".format(self.current_package()))
         self.handle_app_dialogs(dia_kws, seconds=float(step.get("dialog_timeout", 25)))
 
@@ -1128,13 +1184,13 @@ class WalletBot:
             self.swipe(self.width * 0.5, self.height * 0.75,
                        self.width * 0.5, self.height * 0.30, 500)
             n += 1
-            time.sleep(max(1.0, min(8.0, (end - time.time()) / 3)))
+            nap(max(1.0, min(8.0, (end - time.time()) / 3)))
         log("  浏览 {}s（滑动 {} 次）".format(int(browse), n))
 
         self.key("3")  # 回桌面
-        time.sleep(2.0)
+        nap(2.0)
         self.bring_wallet_front()
-        time.sleep(3.0)
+        nap(3.0)
         return True
 
     def action_trial_tasks(self, step: dict) -> bool:
@@ -1173,7 +1229,7 @@ class WalletBot:
                              or self.find_target("明日再来可领")):
                 log("  弹「今日试用已完成」倒计时框，关掉后重读面板")
                 self.close_trial_hint()
-                time.sleep(1.2)
+                nap(1.2)
                 self.open_task_panel()
                 rows = self.panel_rows()
             log("  第 {} 轮面板: {}".format(
@@ -1184,7 +1240,7 @@ class WalletBot:
                 log("  领奖: 「{}」".format(claim["title"][:10]))
                 self.tap(claim["x"], claim["y"])
                 touched.add((claim["title"][:6], "claim"))
-                time.sleep(3.0)
+                nap(3.0)
                 handled += 1
                 continue
             launch = next((r for r in rows if phase_of(r["btn"]) == "launch"
@@ -1215,14 +1271,14 @@ class WalletBot:
         if not rows and (self.find_target("今日试用已完成")
                          or self.find_target("明日再来可领")):
             self.close_trial_hint()
-            time.sleep(1.2)
+            nap(1.2)
             self.open_task_panel()
             rows = self.panel_rows()
         claim = next((r for r in rows if "领取" in r["btn"]), None)
         if claim:
             log("  收尾领奖: 「{}」".format(claim["title"][:10]))
             self.tap(claim["x"], claim["y"])
-            time.sleep(3.0)
+            nap(3.0)
             handled += 1
 
         log("  试用任务共处理 {} 步".format(handled))
@@ -1283,7 +1339,7 @@ class WalletBot:
                     return kw
             if time.time() >= deadline:
                 return None
-            time.sleep(0.6)
+            nap(0.6)
 
     # ---------- 动作 ----------
     def action_ad(self, step: dict) -> bool:
@@ -1302,13 +1358,13 @@ class WalletBot:
                 if cd != last_cd:
                     log("  广告倒计时: {}".format(cd))
                     last_cd = cd
-                time.sleep(1.1)
+                nap(1.1)
                 continue
             if time.time() - start >= grace and self.click_any(close_kws, timeout=1.2):
                 log("  已关闭广告页")
-                time.sleep(1.5)
+                nap(1.5)
                 return True
-            time.sleep(1.0)
+            nap(1.0)
         log("  广告等待超时（{}s，见过倒计时={}）".format(int(max_s), saw_countdown))
         return saw_countdown
 
@@ -1340,10 +1396,10 @@ class WalletBot:
         elif act == "trial_tasks":
             ok = self.action_trial_tasks(step)
         elif act == "sleep":
-            time.sleep(float(step.get("seconds", 1)))
+            nap(float(step.get("seconds", 1)))
         elif act == "back":
             self.key("4")
-            time.sleep(float(step.get("seconds", 1.2)))
+            nap(float(step.get("seconds", 1.2)))
         elif act == "home":
             self.key("3")
         elif act == "swipe":
@@ -1353,13 +1409,13 @@ class WalletBot:
                 self.swipe(w * 0.5, h * 0.8, w * 0.5, h * 0.35, 300)
             elif direction == "down":
                 self.swipe(w * 0.5, h * 0.35, w * 0.5, h * 0.8, 300)
-            time.sleep(float(step.get("seconds", 1.0)))
+            nap(float(step.get("seconds", 1.0)))
         elif act == "tap":
             # 坐标兜底：纯图标按钮没有文字节点时用，坐标是物理像素
             point = step.get("point") or [0, 0]
             log("  点击坐标 ({}, {})".format(point[0], point[1]))
             self.tap(point[0], point[1], jitter=int(step.get("jitter", 0)))
-            time.sleep(float(step.get("seconds", 1.2)))
+            nap(float(step.get("seconds", 1.2)))
         elif act == "shot":
             self.shot(desc)
         elif act == "launch":
@@ -1370,7 +1426,7 @@ class WalletBot:
         if not ok and not optional:
             self.shot("fail_step{}".format(index))
             raise RuntimeError("关键步骤失败: {}".format(desc))
-        time.sleep(float(step.get("post_sleep", 0.8)))
+        nap(float(step.get("post_sleep", 0.8)))
 
     # ---------- 主流程 ----------
     def run(self) -> tuple[bool, str]:
@@ -1393,7 +1449,7 @@ class WalletBot:
             # 退回 adb 方式启动，避免 atx-agent 掉线时整轮失败
             shell("monkey -p {} -c android.intent.category.LAUNCHER 1".format(cfg["package"]))
             log("已通过 adb monkey 启动 {}".format(cfg["package"]))
-        time.sleep(2.0)
+        nap(2.0)
 
         self.keep_awake(True)
         try:
@@ -1429,10 +1485,14 @@ def main() -> int:
     parser.add_argument("--dry", action="store_true", help="只连接并打印界面文本")
     args = parser.parse_args()
 
+    global HUMANIZE
+
     init_dirs()
     cfg = load_config()
+    HUMANIZE = bool(cfg["humanize"])
     log("=" * 60)
-    log("开始执行，模式: {}".format("dry" if args.dry else "run"))
+    log("开始执行，模式: {}，拟人化: {}".format(
+        "dry" if args.dry else "run", "开" if HUMANIZE else "关"))
 
     state = read_state()
     today = dt.date.today().isoformat()
@@ -1482,7 +1542,7 @@ def main() -> int:
             bot.close()
         if attempt < attempts:
             log("30 秒后重试")
-            time.sleep(30)
+            nap(30)
 
     if success:
         state["last_success"] = today
