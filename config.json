@@ -2,6 +2,9 @@
   "package": "com.mipay.wallet",
   "serial": "",
   "device_wait_seconds": 120,
+  "network_check": true,
+  "network_retries": 3,
+  "network_settle": 25,
   "success_keywords": [
     "已领取",
     "明日再来",

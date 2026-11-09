@@ -106,6 +106,10 @@ def notify(cfg: dict, title: str, body: str) -> None:
         log("通知发送失败: {}".format(exc))
 
 
+class NetworkUnavailable(RuntimeError):
+    """手机没有可用网络，且重试重启 WiFi 后仍未恢复"""
+
+
 class WalletBot:
     def __init__(self, cfg: dict):
         self.cfg = cfg
@@ -115,6 +119,7 @@ class WalletBot:
         self.inject = "shell"
         self.has_root = False
         self.ad_tasks_ok: bool | None = None
+        self.net_ok: bool | None = None
         self._last_wake = 0.0
 
     # ---------- 连接与唤醒 ----------
@@ -300,6 +305,68 @@ class WalletBot:
             self.swipe(self.width * 0.5, self.height * 0.85,
                        self.width * 0.5, self.height * 0.35, 300)
             time.sleep(1.2)
+
+    # ---------- 网络 ----------
+    # 手机断网时活动页只会白屏，脚本会照常点 6 分钟然后报"未检测到成功标识"，
+    # 既浪费时间又产生误导性结论。所以每次开跑前先确认真能上外网。
+    # 探测点用纯 IP + 域名混合：单个 DNS 可能屏蔽 ICMP（实测 114.114.114.114 就不回包），
+    # 只要有一个通就算在线。
+    NET_PROBES = ("223.5.5.5", "119.29.29.29", "www.baidu.com")
+
+    def phone_online(self) -> bool:
+        """手机当前是否能访问外网（ICMP 探测，任一目标回包即算在线）"""
+        for host in self.NET_PROBES:
+            out = shell("ping -c 1 -W 2 {}".format(host), timeout=8)
+            if re.search(r"1 (?:packets )?received", out):
+                return True
+        return False
+
+    def cycle_wifi(self) -> None:
+        """关掉再打开 WiFi。用 root 转发，普通 shell 改不了 WiFi 状态"""
+        log("  关闭 WiFi")
+        shell_root("svc wifi disable")
+        time.sleep(3.0)
+        log("  重新打开 WiFi")
+        out = shell_root("svc wifi enable")
+        if "Error" in out or "Exception" in out:
+            # Android 12+ 上 svc 有时被弃用，退回 cmd wifi
+            shell_root("cmd wifi set-wifi-enabled enabled")
+        time.sleep(2.0)
+
+    def ensure_network(self, retries: int = 3, settle: float = 25.0) -> bool:
+        """确认手机能上网；断网则重启 WiFi，最多重试 retries 轮
+
+        每轮流程：检测 → 断网则关/开 WiFi → 在 settle 秒内轮询等待恢复。
+        全部失败返回 False，由 run() 抛出 NetworkUnavailable 直接退出，
+        不进入后面必然白跑的活动页流程。
+        """
+        if not self.cfg.get("network_check", True):
+            log("  已关闭网络检查（config.network_check=false），跳过")
+            return True
+        if self.phone_online():
+            log("  网络正常")
+            self.net_ok = True
+            return True
+
+        for i in range(1, max(1, retries) + 1):
+            log("  第 {}/{} 轮: 手机没有网络，重启 WiFi 试试".format(i, retries))
+            self.shot("no_network_{}".format(i))
+            try:
+                self.cycle_wifi()
+            except Exception as exc:
+                log("  开关 WiFi 失败: {}".format(exc))
+
+            deadline = time.time() + max(5.0, settle)
+            while time.time() < deadline:
+                time.sleep(3.0)
+                if self.phone_online():
+                    log("  网络已恢复（第 {} 轮重试成功）".format(i))
+                    self.net_ok = True
+                    return True
+            log("  第 {} 轮重试后仍无网络".format(i))
+
+        self.net_ok = False
+        return False
 
     # ---------- 元素工具 ----------
     def shot(self, tag: str) -> None:
@@ -1311,6 +1378,14 @@ class WalletBot:
         self.connect()
         self.wake()
 
+        # 没网的话后面全是白跑：活动页白屏、宝箱点不出来、最后报"未检测到成功标识"
+        retries = int(cfg.get("network_retries", 3))
+        settle = float(cfg.get("network_settle", 25))
+        if not self.ensure_network(retries=retries, settle=settle):
+            self.shot("no_network")
+            raise NetworkUnavailable(
+                "手机无网络，重启 WiFi {} 次仍未恢复，放弃本轮".format(retries))
+
         try:
             self.d.app_start(cfg["package"], wait=True)
             log("已启动 {}".format(cfg["package"]))
@@ -1388,6 +1463,17 @@ def main() -> int:
             if success:
                 break
             log("结果不理想: {}".format(reason))
+        except NetworkUnavailable as exc:
+            # 网络重试已经做过（不止一次重启 WiFi），再重跑整轮只是重复消耗时间，
+            # 直接退出并推送告警，等人处理。
+            reason = str(exc)
+            log("网络不可用: {}".format(reason))
+            log("已重试 {} 次重启 WiFi，退出本次执行".format(cfg.get("network_retries", 3)))
+            shot_list = "\n".join(str(p) for p in bot.shots[-2:])
+            notify(cfg, "小米钱包每日领取失败（手机无网络）",
+                   "{}\n截图: {}\n请检查手机 WiFi 或路由器，恢复后手动跑一次。".format(
+                       reason, shot_list or "无"))
+            return 3
         except Exception as exc:
             reason = str(exc)
             log("异常: {}".format(reason))

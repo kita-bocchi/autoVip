@@ -74,6 +74,16 @@ Enable-ScheduledTask -TaskName "XiaomiWalletDaily"
 - 第 2、3 条**经常需要冷启动**（`am force-stop` 后重进）才刷出来，这是正常机制，不是 bug。
 - 冷启动后 H5 要 **约 14 秒**才重新渲染出按钮，只查一次必然漏。
 
+### 网络
+
+- 检查方式：从**手机**侧 `ping`，不是从电脑侧。手机没网才是真问题（活动页是 H5）。
+- 探测点：`223.5.5.5` / `119.29.29.29` / `www.baidu.com`，**任一回包即算在线**。
+  不能只用一个：`114.114.114.114` 实测屏蔽 ICMP，单点判定会把"有网"误判成"断网"。
+- 恢复手段：`svc wifi disable` → 3s → `svc wifi enable`（root）。实测恢复约 2 秒。
+  失败时退回 `cmd wifi set-wifi-enabled enabled`。
+- 时序：3 轮 × (3s + settle 25s + 开关 5s) ≈ 100 秒后给退出码 3。
+- 局限：识别的是「能不能到公网」，识别不了需要网页登录的认证热点（能 ping 通但打不开 H5）。
+
 ---
 
 ## 三、代码地图
@@ -96,6 +106,7 @@ Enable-ScheduledTask -TaskName "XiaomiWalletDaily"
 | `ensure_activity_page()` / `on_activity_page()` | 活动页判定与到达 | 中 |
 | `_wake_nodes()` | WebView 节点折叠自愈 | 低，但别删 |
 | `keep_awake()` / `wake()` | 防熄屏 / 解锁 | 低 |
+| `phone_online()` / `cycle_wifi()` / `ensure_network()` | 网络检查与重启 WiFi | 低，但调用位置有讲究（见坑 14） |
 | `escape_foreign()` | 误跳外部 App 时撤回 | 低 |
 
 ---
@@ -161,6 +172,7 @@ Enable-ScheduledTask -TaskName "XiaomiWalletDaily"
 | 26 | 换设备/重置桌面后整轮白做 | `launch_from_widget()` 找不到组件直接 `return False`，后续全在桌面上空跑 | 新增 `enter_from_app()` 兜底（已实测通过） |
 | 27 | 新账号怎么都不开箱 | 开箱坐标只有 0.440/0.460 两个 | 候选扩到 5 个 |
 | 28 | 一条广告没做成也报成功（假成功） | 判定条件是「面板里有『去完成』」 | 改为必须看到主按钮「做任务 领…」才判成功 |
+| 29 | 手机断网时空跑 6 分钟，最后报「未检测到成功标识」 | 流程里没有任何网络前置检查，把「断网」误诊成「界面改版」 | 新增 `ensure_network()`：ping 三个目标 → 不通则关/开 WiFi → 每轮等 25s → 3 轮全败抛 `NetworkUnavailable`，退出码 3 |
 
 ---
 
@@ -302,6 +314,24 @@ H5 会保留滚动位置，滑下去之后可能再也找不到入口（代码�
 
 `exit 0` 只代表"流程判定成功"，不代表"奖励到账"。
 **唯一可信证据是会员时长增长。**
+
+反过来，看到非 0 也先分辨是哪一类：
+
+| 码 | 含义 | 该做什么 |
+|---|---|---|
+| 2 | 流程跑完但没判定成功 | 看截图，多半是文案变了 |
+| 3 | 手机没网，重启 WiFi 多轮仍失败 | 查 WiFi / 路由器，别去改代码 |
+
+码 3 是「环境问题」，不要拿它当界面改版去调关键词 —— 这是两种完全不同的处理方向。
+
+### 坑 14：网络检查必须放在启动 App 之前
+
+`run()` 里的顺序是 `connect → wake → ensure_network → app_start → steps`。
+如果挪到后面（比如放进 steps 里当普通一步），断网时会先启动 App、进活动页、点一圈空，
+再回头发现没网——前面全白做，而且日志会误导成"界面没加载出来"。
+
+同理，`ensure_network` 返回 False 时必须 `raise NetworkUnavailable` 直接退出，
+不能 return False 让它继续往下跑。
 
 ---
 
