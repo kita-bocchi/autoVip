@@ -1,0 +1,22 @@
+# 运行时产物（不入库）
+logs/
+shots/
+probe/
+state.json
+*.log
+
+# 项目内环境（不入库，按 README 第 2 步重建）
+.venv/
+tools/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# 编辑器 / 系统
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+desktop.ini
