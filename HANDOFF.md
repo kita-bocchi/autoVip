@@ -18,7 +18,7 @@
 | 全流程 | ✅ 一次跑通，零人工干预，约 6 分钟 |
 | 最近一次收益 | 三条看广告 + 一条试用全部自动完成（合计约 4 天） |
 | 当日任务构成 | 3 条看广告 + 1 条试用（第 2 天） |
-| 计划任务 | ⚠️ `XiaomiWalletDaily` 存在，但当前是 **Disabled**，需手动启用 |
+| 计划任务 | ✅ 已启用，每天 **07:00** 静默运行（`pythonw`，无窗口） |
 | 邀请任务 | 0/5，**有意不做**（需要真实新用户，1 天会员，性价比低、风险高） |
 | 维护强度 | 每 1~2 周可能需跟着 App 改版加一个关键词 |
 
@@ -115,7 +115,7 @@ Enable-ScheduledTask -TaskName "XiaomiWalletDaily"
 | 5 | 广告跳到应用商店后流程全乱 | 前台包名已变 | `escape_foreign()` 连按返回撤回 |
 | 6 | 广告刚加载就点「关闭」，反而点进广告 | 静默期不足 | `grace_seconds`（默认 8s） |
 | 7 | 设备没就绪直接退出 | 只查一次 `adb devices` | `wait_device(120)` + 中途 `kill-server` 重试 |
-| 8 | 08:10 电脑睡眠就永久错过 | 任务默认 `StartWhenAvailable=False` | `Set-ScheduledTask` 改 True、不限电池、`ExecutionTimeLimit=PT2H` |
+| 8 | 到点时电脑在睡眠，任务永久错过 | 任务默认 `StartWhenAvailable=False` | `Set-ScheduledTask` 改 True、不限电池、`ExecutionTimeLimit=PT2H` |
 | 9 | 开发者选项点了就退出 | 组件被精简工具 `pm disable` | `pm enable 'com.android.settings/.Settings$DevelopmentSettingsDashboardActivity'` + 重启 |
 
 ### 11-05 入口与节点
@@ -210,9 +210,9 @@ Enable-ScheduledTask -TaskName "XiaomiWalletDaily"
    但两者到网关/172.16.4.100 都通。定位为**深信服客户端**（SangforPWEx/SangforSP）
    做的终端间横向阻断。*结论：只能用 USB，别浪费时间调无线。*
 
-9. **计划任务当前是 Disabled**
-   且 `LogonType=Interactive`：锁屏可以跑，注销/重启后未登录不跑。
-   要彻底无人值守需改「不管用户是否登录都运行」（会要求存密码）。
+9. **计划任务的登录类型是 `Interactive`**
+   已于 2026-11-09 启用（每天 07:00），但 `LogonType=Interactive`：锁屏可以跑，
+   注销/重启后未登录不跑。要彻底无人值守需改「不管用户是否登录都运行」（会要求存密码）。
 
 10. **`schtasks.exe` 被安全软件黑名单拦截**
     注册/修改计划任务请用 PowerShell（`Set-ScheduledTask` / `Enable-ScheduledTask`）。

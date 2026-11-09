@@ -8,7 +8,7 @@
 一句话原理：**脚本不在手机上跑，手机只是执行终端**。电脑负责调度、判断、重试、取证。
 
 ```
-08:10  计划任务（Windows）
+07:00  计划任务（Windows）
          │  wallet_daily.py
          ├─ adb 连手机 → 点亮 → 解锁 → 屏幕常亮
          ├─ 回桌面点「钱包玩家视界」小组件（找不到就回退 App 内入口）
@@ -152,14 +152,22 @@ run.bat --force
 setup_task.bat
 ```
 
-注册任务 `XiaomiWalletDaily`，每天 08:10 用 `pythonw.exe` 静默执行。
+注册任务 `XiaomiWalletDaily`，每天 07:00 用 `pythonw.exe` 静默执行。
 
-**注意：注册后默认是「就绪」状态，但本项目当前的任务处于 Disabled。** 启用方式：
+**注意：`schtasks` 注册出来是「就绪」可直接跑；如果任务被停用过，需要显式启用：**
 
 ```powershell
 Enable-ScheduledTask -TaskName "XiaomiWalletDaily"
 Start-ScheduledTask  -TaskName "XiaomiWalletDaily"   # 立刻跑一次验证
 ```
+
+想改执行时间（例如改成 07:00）：
+
+```powershell
+Set-ScheduledTask -TaskName "XiaomiWalletDaily" -Trigger (New-ScheduledTaskTrigger -Daily -At 07:00)
+```
+
+改完用 `Get-ScheduledTaskInfo` 确认 `NextRunTime`。
 
 建议在「任务计划程序」里再改两处：勾「不管用户是否登录都要运行」、勾「使用最高权限运行」。
 （`schtasks.exe` 在本机曾被安全软件拦截，改用 PowerShell 的 `Set-ScheduledTask` 更稳。）
