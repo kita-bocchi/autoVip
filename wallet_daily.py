@@ -139,6 +139,16 @@ class NetworkUnavailable(RuntimeError):
     """手机没有可用网络，且重试重启 WiFi 后仍未恢复"""
 
 
+class EnvError(RuntimeError):
+    """环境问题：没 adb、没设备、未授权、offline、缺依赖。
+
+    这里**必须**是 Exception 的子类，不能再用 SystemExit。
+    SystemExit 继承自 BaseException，`except Exception` 接不住，会直接穿透 main()，
+    结果是：日志停在半句话、退出码 1、pythonw 下 stderr 被丢弃——
+    2026-11-10 就是这么静默失败的（设备 unauthorized，什么都没记下来）。
+    """
+
+
 class WalletBot:
     def __init__(self, cfg: dict):
         self.cfg = cfg
@@ -166,7 +176,16 @@ class WalletBot:
                     log("设备已恢复上线: {}".format(last))
                 return last
             if "unauthorized" in states.values():
-                return last  # 需要人工点允许，交给上层报错
+                # 2026-11-10 实测：这种情况下重启 adb 服务就能恢复（授权状态
+                # 残留在旧 server 进程里），不是真的需要人去点「允许」。
+                # 所以先自动重启一次，仍然 unauthorized 才交给上层报错。
+                if not restarted:
+                    log("设备未授权，重启 adb 服务后重试一次")
+                    adb("kill-server")
+                    nap(2.0)
+                    restarted = True
+                    continue
+                return last  # 重启过还是不行，需要人工点允许
             left = deadline - time.time()
             if left <= 0:
                 return last
@@ -187,7 +206,7 @@ class WalletBot:
     def preflight(self) -> str:
         """检查 adb 与设备状态，返回可用序列号"""
         if not setup_adb():
-            raise SystemExit("找不到 adb：请确认 tools/platform-tools/adb.exe 存在，"
+            raise EnvError("找不到 adb：请确认 tools/platform-tools/adb.exe 存在，"
                              "或把 adb 加入 PATH")
         cfg_serial = (self.cfg.get("serial") or "").strip()
         if cfg_serial:
@@ -195,7 +214,7 @@ class WalletBot:
             ensure_online(cfg_serial)
         devs = self.wait_device(float(self.cfg.get("device_wait_seconds", 120)))
         if not devs:
-            raise SystemExit(
+            raise EnvError(
                 "等待 {} 秒后仍未检测到设备。请检查：\n"
                 "  1) 换一根能传数据的 USB 线\n"
                 "  2) 手机已开启「USB 调试」\n"
@@ -204,31 +223,32 @@ class WalletBot:
                     self.cfg.get("device_wait_seconds", 120)))
 
         states = dict(devs)
+        log("  设备状态: {}".format(", ".join("{}={}".format(k, v) for k, v in states.items())))
         if "unauthorized" in states.values():
-            raise SystemExit("设备未授权：解锁手机，在「允许 USB 调试」弹窗里点允许")
+            raise EnvError("设备未授权：解锁手机，在「允许 USB 调试」弹窗里点允许")
         if "offline" in states.values():
-            raise SystemExit("设备 offline：执行 tools\\platform-tools\\adb.exe kill-server "
+            raise EnvError("设备 offline：执行 tools\\platform-tools\\adb.exe kill-server "
                              "后重新插拔数据线")
 
         serials = [s for s, st in devs if st == "device"]
         if not serials:
-            raise SystemExit("设备状态异常: {}".format(states))
+            raise EnvError("设备状态异常: {}".format(states))
 
         cfg_serial = (self.cfg.get("serial") or "").strip()
         if cfg_serial:
             if cfg_serial not in serials:
-                raise SystemExit("config.json 指定的 serial {} 不在线，当前在线: {}".format(
+                raise EnvError("config.json 指定的 serial {} 不在线，当前在线: {}".format(
                     cfg_serial, serials))
             return cfg_serial
         if len(serials) > 1:
-            raise SystemExit("检测到多台设备 {}，请在 config.json 的 serial 里指定一台".format(serials))
+            raise EnvError("检测到多台设备 {}，请在 config.json 的 serial 里指定一台".format(serials))
         return serials[0]
 
     def connect(self) -> None:
         try:
             import uiautomator2 as u2
         except ImportError:
-            raise SystemExit("缺少依赖，请执行: .venv\\Scripts\\python.exe -m pip install "
+            raise EnvError("缺少依赖，请执行: .venv\\Scripts\\python.exe -m pip install "
                              "-r requirements.txt")
 
         serial = self.preflight()
@@ -237,7 +257,7 @@ class WalletBot:
         try:
             self.d = u2.connect(serial)
         except Exception as exc:
-            raise SystemExit("连接设备失败: {}\n首次连接需要打开「USB 安装」以部署 atx-agent".format(exc))
+            raise EnvError("连接设备失败: {}\n首次连接需要打开「USB 安装」以部署 atx-agent".format(exc))
 
         self.has_root = has_root()
         self.inject = "root" if self.has_root else "shell"
@@ -1523,6 +1543,16 @@ def main() -> int:
             if success:
                 break
             log("结果不理想: {}".format(reason))
+        except EnvError as exc:
+            # 环境问题重试无用（没设备/未授权/offline 都要人去处理），
+            # 立刻写清原因并退出，不要再静默穿透。
+            reason = str(exc)
+            log("环境问题: {}".format(reason))
+            shot_list = "\n".join(str(p) for p in bot.shots[-2:])
+            notify(cfg, "小米钱包每日领取失败（环境问题）",
+                   "{}\n截图: {}\n处理完可直接手动跑一次，或等明天计划任务。".format(
+                       reason, shot_list or "无"))
+            return 4
         except NetworkUnavailable as exc:
             # 网络重试已经做过（不止一次重启 WiFi），再重跑整轮只是重复消耗时间，
             # 直接退出并推送告警，等人处理。

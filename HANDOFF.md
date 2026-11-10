@@ -177,6 +177,14 @@ Enable-ScheduledTask -TaskName "XiaomiWalletDaily"
 | 30 | 行为特征过于规律，有被判定为脚本的风险 | 73 处 `time.sleep(固定值)`、点击只抖 ±3px、广告恰好停 14.0s、每天 07:00:00 准点启动 | 新增 `nap()`（基准×0.90~1.50）、`ad_dwell()`（14s→16~26s）、`tap()` 改高斯抖动 σ≈10px/最大±21px、`swipe()` 随机时长与端点、任务计划加 `RandomDelay=PT60M` |
 | 31 | 拟人化后怀疑流程会被"等太久"拖坏 | 随机等待有下限也有上限 | 下限取 0.90 倍（从不短于原值 10%），广告停留只往上随机；实测 3m12s 完成，判定与改动前一致 |
 
+### 11-10 静默失败修复（当日计划任务没跑成）
+
+| # | 现象 | 根因 | 修法 |
+|---|---|---|---|
+| 32 | 计划任务 LastResult=1，日志只有 192 字节，停在「第 1/2 次尝试」 | `preflight()` 抛的是 `SystemExit`，它继承 `BaseException`，`except Exception` 接不住 → 直接穿透 `main()`，诊断信息既没进日志，`pythonw` 下 stderr 也被丢弃 | 新增 `EnvError(RuntimeError)`，9 处 `raise SystemExit` 全部改掉；主循环加 `except EnvError` 分支，记录原因 + 推送告警 + 返回退出码 **4**，且不重试 |
+| 33 | 设备状态 `unauthorized`，看起来只能人工点「允许」 | adb 服务的授权状态残留在旧 server 进程里，杀进程重启即可恢复（实测有效） | `wait_device()` 遇到 unauthorized 先自动 `kill-server` + 等 2s 重试一次，仍不行才报错 |
+| 34 | 设备状态查不到，无法判断卡在哪 | `preflight` 没有打印 adb 侧状态 | 现在就绪后先 `log("设备状态: ...")`，正常路径也会留下这行 |
+
 ---
 
 ## 五、未解决的问题
@@ -354,6 +362,23 @@ H5 会保留滚动位置，滑下去之后可能再也找不到入口（代码�
 
 反过来，`humanize=false` 只用于调试复现；**别把它当成正式配置留着**，
 否则所有随机化失效，退回脚本特征。
+
+### 坑 16：不要在业务流程里 `raise SystemExit`
+
+`SystemExit` 继承 `BaseException` 而不是 `Exception`，所以：
+
+- `except Exception` 接不住它 → 直接穿透到解释器
+- `sys.exit(main())` 根本没机会执行
+- 计划任务里 `pythonw.exe` 没有控制台，错误信息**被完全丢弃**
+- 最终只留下：退出码 1 + 半句话日志
+
+2026-11-10 就踩了这个：设备 `unauthorized`，日志停在「第 1/2 次尝试」，
+192 字节，什么都看不出来，白白耽误一天。
+
+**规则**：流程内抛 `EnvError` / `NetworkUnavailable`；`SystemExit` 只允许出现在
+`if __name__ == "__main__"` 之外没人接的地方——实际上就是别用。
+
+写完后自检：`grep -n "SystemExit" wallet_daily.py` 应该只在注释里出现。
 
 ---
 
