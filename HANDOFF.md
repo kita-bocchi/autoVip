@@ -197,6 +197,21 @@ Enable-ScheduledTask -TaskName "XiaomiWalletDaily"
 **实测数据（2026-11-10）**：08:53 领 1 条 → 09:22 冷启动后连领 2 条（中间无冷却）→
 会员时长 58.73 → 59.66 天（+22 小时）。说明"冷却"是**批次级**的，不是每条之间都有。
 
+### 11-10 下午：计划任务运行时满屏闪 cmd 窗口（用户报障）
+
+第一次真正完整地用 `pythonw.exe` 跑流程，暴露了这个一直存在但没触发的缺陷。
+07:55 那次没被发现，是因为它一行就失败、只起了两三个 adb 进程。
+
+| # | 现象 | 根因 | 修法 |
+|---|---|---|---|
+| 37 | 计划任务运行期间屏幕上不停闪 cmd 窗口 | `pythonw.exe` 是 GUI 子系统进程，**没有控制台**。它启动的每个控制台程序（`adb.exe`）都会被 Windows 新分配一个 console，于是每次 adb 调用闪一个窗口。一轮流程上百次 adb 调用 | `adb_env.hide_child_windows()`：在模块导入时给 `subprocess.Popen.__init__` 打补丁，强制加 `CREATE_NO_WINDOW` + `STARTF_USESHOWWINDOW/SW_HIDE`。改在 Popen 层而不是 `adb()` 里，是为了连 `uiautomator2`/`adbutils` 内部的 adb 调用一起覆盖 |
+
+**验证方式（可复用）**：`pythonw` 起一个循环调 adb 的脚本，同时用 `Get-Process adb`
+采样 `MainWindowHandle`。补丁前 133 次采样里 **54 次带窗口句柄**；补丁后 118 次采样
+**0 次带窗口句柄**。功能侧同时确认 `adb devices`、`shell`、`su -c id` 均正常。
+
+注意：`Add-Type` 枚举窗口句柄会触发安全策略拦截，用 `MainWindowHandle` 采样更省事。
+
 ---
 
 ## 五、未解决的问题
@@ -406,6 +421,25 @@ H5 会保留滚动位置，滑下去之后可能再也找不到入口（代码�
 
 反过来，如果发现"重进后立刻就有入口"（今天 09:22 就是 0.4 秒出现），
 说明此时根本没有冷却，别加等待，直接进循环。
+
+---
+
+### 坑 18：手动跑没事，不代表计划任务跑没事
+
+`run.bat` / 手动 `python` 是在**有控制台**的进程里跑的，子进程继承同一个控制台，
+所以你什么都看不到。而计划任务用的是 `pythonw.exe`（无控制台），
+每个子控制台程序都会**新弹一个窗口**。
+
+任何"需要用户交互 / 会弹窗 / 有可见副作用"的代码，都必须在 `pythonw` 下验证一遍，
+否则只在手动调试时是正常的。验证命令：
+
+```powershell
+Start-Process -FilePath ".\.venv\Scripts\pythonw.exe" -ArgumentList "wallet_daily.py" -WorkingDirectory (Get-Location) -WindowStyle Hidden
+```
+
+本次修复（`adb_env.hide_child_windows()`）是在 `subprocess.Popen` 层打的补丁，
+所以**新增任何外部命令调用都不用再单独处理**。但如果你绕开 subprocess
+（`os.system`、`shell=True` 之外的第三方库自带的 C 扩展启动进程），窗口会重新出现。
 
 ---
 

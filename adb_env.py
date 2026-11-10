@@ -19,6 +19,36 @@ LOCAL_ADB = BASE / "tools" / "platform-tools"
 _SERIAL: str | None = None
 
 
+def hide_child_windows() -> None:
+    """让所有子进程（adb.exe 等）不再弹出控制台窗口
+
+    pythonw.exe 自身没有控制台，Windows 会给它启动的每个控制台程序
+    （adb.exe 就是）新分配一个 console，屏幕上表现为不停闪 cmd 窗口。
+    计划任务下每轮上百次 adb 调用，闪得没法用电脑。
+
+    这里直接改 subprocess.Popen：不仅覆盖本文件的 adb()，
+    也覆盖 uiautomator2 / adbutils 内部的调用，一次到位。
+    """
+    if os.name != "nt" or getattr(subprocess, "_wb_hidden", False):
+        return
+    CREATE_NO_WINDOW = 0x08000000
+    orig_init = subprocess.Popen.__init__
+
+    def _init(self, *args, **kwargs):
+        kwargs["creationflags"] = kwargs.get("creationflags", 0) | CREATE_NO_WINDOW
+        si = kwargs.get("startupinfo") or subprocess.STARTUPINFO()
+        si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+        si.wShowWindow = subprocess.SW_HIDE
+        kwargs["startupinfo"] = si
+        return orig_init(self, *args, **kwargs)
+
+    subprocess.Popen.__init__ = _init
+    subprocess._wb_hidden = True  # 防重复打补丁
+
+
+hide_child_windows()
+
+
 def setup_adb() -> str | None:
     """把项目内 adb 目录塞进 PATH，返回 adb 可执行文件路径"""
     exe = LOCAL_ADB / ("adb.exe" if os.name == "nt" else "adb")

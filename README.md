@@ -417,6 +417,7 @@ state.json                    # {"last_success": "<日期>", ...}
 | 读不到任何文字（截图正常） | WebView 无障碍节点折叠 | 代码有 `_wake_nodes()` 自动唤醒；无效时手动大幅滑动再滑回 |
 | 手机重启后失效 | USB 授权丢失 | 重插授权；不要用 `adb tcpip` 无线调试 |
 | 计划任务没跑 | 任务是 Disabled / 未登录 | `Enable-ScheduledTask`，并勾「不管用户是否登录都运行」 |
+| 运行期间屏幕上不停闪 cmd 窗口 | `pythonw` 没有控制台，它启动的 `adb.exe` 各自新建一个控制台窗口 | 已在 `adb_env.hide_child_windows()` 里给所有子进程加 `CREATE_NO_WINDOW`；若又出现，说明有代码绕过 `adb_env` 直接 `subprocess` 调外部程序 |
 
 ---
 
