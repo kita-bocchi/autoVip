@@ -53,7 +53,7 @@
       "do": "ad_tasks",
       "rounds": 4,
       "page_rounds": 4,
-      "page_reenter": 3,
+      "page_reenter": 2,
       "page_watch_seconds": 14,
       "max_seconds": 100,
       "watch_keywords": [
@@ -83,7 +83,11 @@
       ],
       "optional": false,
       "desc": "逐个完成看广告任务",
-      "grace_seconds": 8
+      "grace_seconds": 8,
+      "page_reenter_waits": [
+        120,
+        300
+      ]
     },
     {
       "do": "trial_tasks",

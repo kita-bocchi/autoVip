@@ -850,7 +850,13 @@ class WalletBot:
         """循环做活动页主入口的「看10秒」，返回完成次数"""
         rounds = int(step.get("page_rounds", 3))
         wait_s = float(step.get("page_watch_seconds", 14))
-        reenter_left = int(step.get("page_reenter", 1))
+        reenter_total = int(step.get("page_reenter", 2))
+        reenter_left = reenter_total
+        # 每次冷启动重进前要等多久（秒）。领完一条后存在冷却期：
+        # 2026-11-10 实测 08:58 领完 → 08:53/09:03 两次冷启动都无入口 →
+        # 09:22 冷启动后 0.4 秒就出现「再看10秒」。只重进一次就判定"今天做完了"
+        # 会漏掉后面所有广告，所以必须按递增间隔多试几次。
+        waits = step.get("page_reenter_waits") or [90, 300, 600]
         done = 0
         while done < rounds:
             hit = self.wait_ad_entry()
@@ -858,15 +864,25 @@ class WalletBot:
                 if reenter_left <= 0:
                     log("  没有「看10秒」入口了，今天广告任务做完（共 {} 条）".format(done))
                     break
-                reenter_left -= 1
-                log("  入口消失，冷启动重进活动页找下一条")
-                if not self.launch_from_widget(cold=True):
-                    break
-                # 重进后 H5 要重新加载才会出现按钮，实测约 14 秒，
-                # 只查一次就放弃会漏掉后面的广告（今天 2、3 条就是这样丢的）
-                hit = self.wait_ad_entry(tries=8, delay=3.0)
-                if not hit:
-                    log("  重进后仍无入口，判定今天广告已做完（共 {} 条）".format(done))
+                got = False
+                while reenter_left > 0:
+                    idx = reenter_total - reenter_left
+                    wait = waits[min(idx, len(waits) - 1)]
+                    reenter_left -= 1
+                    log("  入口消失（领完后有冷却期），等 {}s 后第 {}/{} 次冷启动重进".format(
+                        int(wait), idx + 1, reenter_total))
+                    nap(wait, 1.0, 1.0)
+                    if not self.launch_from_widget(cold=True):
+                        continue
+                    # 重进后 H5 要重新加载才会出现按钮，实测约 14 秒，
+                    # 只查一次就放弃会漏掉后面的广告
+                    hit = self.wait_ad_entry(tries=8, delay=3.0)
+                    if hit:
+                        got = True
+                        break
+                if not got:
+                    log("  冷启动重进 {} 次仍无入口，判定今天广告已做完（共 {} 条）".format(
+                        reenter_total, done))
                     break
             label, x, y = hit
             log("  第 {} 条: 点「{}」@({},{})".format(done + 1, label[:14], x, y))

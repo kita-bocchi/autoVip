@@ -156,6 +156,20 @@ setup_task.bat
 注册任务 `XiaomiWalletDaily`，每天 07:00 之后随机延迟最多 60 分钟启动，用 `pythonw.exe` 静默执行。
 脚本本身不睡觉，延迟由任务计划程序的 `RandomDelay` 完成——固定的 07:00:00 准点触发是最明显的时间指纹。
 
+**需要再注册一个下午的补跑任务**（`XiaomiWalletDailyPM`，17:00 起随机延迟 60 分钟，
+带 `--force` 绕过「今天已成功」的幂等跳过）。原因见「阶段 2」：任务会分批次解锁，
+早上一轮拿不全，下午那轮专门捡漏。
+
+```powershell
+$wd = (Resolve-Path .).Path
+Register-ScheduledTask -TaskName "XiaomiWalletDailyPM" `
+  -Action (New-ScheduledTaskAction -Execute "$wd\.venv\Scripts\pythonw.exe" `
+           -Argument ('"' + $wd + '\wallet_daily.py" --force') -WorkingDirectory $wd) `
+  -Trigger $((($t = New-ScheduledTaskTrigger -Daily -At 17:00); $t.RandomDelay = 'PT60M'; $t)) `
+  -Settings (New-ScheduledTaskSettingsSet -StartWhenAvailable -AllowStartIfOnBatteries `
+             -DontStopIfGoingOnBatteries -MultipleInstances IgnoreNew) -Force
+```
+
 **注意：`schtasks` 注册出来是「就绪」可直接跑；如果任务被停用过，需要显式启用：**
 
 ```powershell
@@ -234,7 +248,12 @@ ping 223.5.5.5 / 119.29.29.29 / www.baidu.com（任一回包即算在线）
 入口消失 → 冷启动重进 → 等约 24 秒再找 → 仍没有才判定今天没广告了
 ```
 
-当前配置：最多 4 条（`page_rounds`），最多冷启动 3 次（`page_reenter`）。
+当前配置：最多 4 条（`page_rounds`），冷启动重进 2 次（`page_reenter`），
+两次之间分别等 120 秒、300 秒（`page_reenter_waits`）。
+
+**为什么要等：领完一条后新任务不是立刻下发的。** 实测 08:58 领完 → 立刻冷启动没入口，
+24 分钟后冷启动 0.4 秒就出现「再看10秒」。所以旧版"重进一次没有就判定今天做完"是错的，
+会漏掉当天后面所有广告。单次运行里等不到的那种分钟级解锁，靠下午 17:00 的第二轮补跑接住。
 
 ### 阶段 3：任务面板里的剩余广告
 
@@ -325,7 +344,7 @@ state.json                    # {"last_success": "<日期>", ...}
 | `do` | 关键参数 | 说明 |
 |---|---|---|
 | `widget` | `cold` | 从桌面小组件进活动页；`cold: true` 先杀进程 |
-| `ad_tasks` | `rounds` `page_rounds` `page_reenter` `page_watch_seconds` `watch_keywords` `skip_keywords` `close_keywords` `grace_seconds` | 页面广告 + 面板广告全套 |
+| `ad_tasks` | `rounds` `page_rounds` `page_reenter` `page_reenter_waits` `page_watch_seconds` `watch_keywords` `skip_keywords` `close_keywords` `grace_seconds` | 页面广告 + 面板广告全套。`page_reenter_waits` 是每次重进前的等待秒数，如 `[120, 300]` |
 | `trial_tasks` | `rounds` `install_timeout` `browse_seconds` `dialog_keywords` | 试用任务全套 |
 | `click` | `texts` `timeout` | 按文字找元素并点击 |
 | `ad` | `max_seconds` `close_keywords` | 等单条广告并关闭 |
