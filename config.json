@@ -119,5 +119,6 @@
   "max_retry": 2,
   "skip_if_done": true,
   "notify_webhook": "",
-  "panel_debug": true
+  "panel_debug": true,
+  "ad_target": 3
 }

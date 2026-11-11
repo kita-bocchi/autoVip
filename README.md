@@ -8,14 +8,17 @@
 一句话原理：**脚本不在手机上跑，手机只是执行终端**。电脑负责调度、判断、重试、取证。
 
 ```
-07:00 + 0~60min 随机  计划任务（Windows）
+07:00 + 0~60min 随机  计划任务 1（主跑）
          │  wallet_daily.py
          ├─ adb 连手机 → 点亮 → 解锁 → 屏幕常亮
          ├─ 回桌面点「钱包玩家视界」小组件（找不到就回退 App 内入口）
          ├─ 阶段一：活动页大按钮「看10秒」→ 跳广告 → 停留 16~26s（随机）→ 切回 → 开宝箱
          ├─ 阶段二：打开任务面板，做完剩余看广告任务
          ├─ 阶段三：试用任务（下载 → 安装 → 试用 30s → 领奖）
-         └─ 校验 → 写 state.json → 截图 + 可选推送
+         └─ 校验 → 写 state.json（含 ads_done 计数）→ 截图 + 可选推送
+
+09:00~21:00 每 2h + 0~12min 随机  计划任务 2（补检 --sweep）
+         └─ ads_done ≥ ad_target 就秒退；否则再跑一遍上面的流程，把新下发的广告领掉
 ```
 
 ---
@@ -156,19 +159,26 @@ setup_task.bat
 注册任务 `XiaomiWalletDaily`，每天 07:00 之后随机延迟最多 60 分钟启动，用 `pythonw.exe` 静默执行。
 脚本本身不睡觉，延迟由任务计划程序的 `RandomDelay` 完成——固定的 07:00:00 准点触发是最明显的时间指纹。
 
-**需要再注册一个下午的补跑任务**（`XiaomiWalletDailyPM`，17:00 起随机延迟 60 分钟，
-带 `--force` 绕过「今天已成功」的幂等跳过）。原因见「阶段 2」：任务会分批次解锁，
-早上一轮拿不全，下午那轮专门捡漏。
+**需要再注册一个补检任务**（`XiaomiWalletDailyPM`，09:00 起每 2 小时一次、持续 12 小时，
+带 `--sweep`）。原因见「阶段 2」：广告任务是**分批下发**的，一天 3 条要分几次才放出来，
+早上那一轮最多拿到 1 条，靠补检每 2 小时扫一次才能凑满。
 
 ```powershell
 $wd = (Resolve-Path .).Path
 Register-ScheduledTask -TaskName "XiaomiWalletDailyPM" `
   -Action (New-ScheduledTaskAction -Execute "$wd\.venv\Scripts\pythonw.exe" `
-           -Argument ('"' + $wd + '\wallet_daily.py" --force') -WorkingDirectory $wd) `
-  -Trigger $((($t = New-ScheduledTaskTrigger -Daily -At 17:00); $t.RandomDelay = 'PT60M'; $t)) `
+           -Argument ('"' + $wd + '\wallet_daily.py" --sweep') -WorkingDirectory $wd) `
+  -Trigger $((($t = New-ScheduledTaskTrigger -Once -At 09:00 `
+                -RepetitionInterval (New-TimeSpan -Minutes 120) `
+                -RepetitionDuration (New-TimeSpan -Hours 12)); $t.RandomDelay = 'PT12M'; $t)) `
   -Settings (New-ScheduledTaskSettingsSet -StartWhenAvailable -AllowStartIfOnBatteries `
-             -DontStopIfGoingOnBatteries -MultipleInstances IgnoreNew) -Force
+             -DontStopIfGoingOnBatteries -ExecutionTimeLimit (New-TimeSpan -Hours 1) `
+             -MultipleInstances IgnoreNew) -Force
 ```
+
+`--sweep` 的判定完全靠 `state.json` 里的 `ads_done` / `ads_date`：
+今天做满 `ad_target`（默认 3）条就**秒退**，不连手机；没满就再跑一轮，只等 90 秒就收工
+（不像主跑那样等到 120s + 300s），因为两小时后还有下一轮来接。
 
 **注意：`schtasks` 注册出来是「就绪」可直接跑；如果任务被停用过，需要显式启用：**
 
@@ -249,11 +259,17 @@ ping 223.5.5.5 / 119.29.29.29 / www.baidu.com（任一回包即算在线）
 ```
 
 当前配置：最多 4 条（`page_rounds`），冷启动重进 2 次（`page_reenter`），
-两次之间分别等 120 秒、300 秒（`page_reenter_waits`）。
+两次之间分别等 120 秒、300 秒（`page_reenter_waits`）。补检模式下只重进 1 次、等 90 秒
+（`page_sweep_reenter` / `page_sweep_waits`），把长等待交给下一轮补检。
 
 **为什么要等：领完一条后新任务不是立刻下发的。** 实测 08:58 领完 → 立刻冷启动没入口，
 24 分钟后冷启动 0.4 秒就出现「再看10秒」。所以旧版"重进一次没有就判定今天做完"是错的，
-会漏掉当天后面所有广告。单次运行里等不到的那种分钟级解锁，靠下午 17:00 的第二轮补跑接住。
+会漏掉当天后面所有广告。
+
+**单轮一定等不到的那部分，靠补检覆盖。** 一天 3 条广告是分批放出来的，
+间隔可达数小时（11-11 实测：07:36 第 1 条 → 09:31 才出现第 2 条 → 第 3 条更晚）。
+所以白天每 2 小时跑一次 `--sweep`，进度记在 `state.json` 的 `ads_done` 里，
+攒满 `ad_target`（默认 3）条后自动停止检查。
 
 ### 阶段 3：任务面板里的剩余广告
 
@@ -309,6 +325,7 @@ ping 223.5.5.5 / 119.29.29.29 / www.baidu.com（任一回包即算在线）
 |---|---|
 | `run.bat` | 正常执行；当天成功过会跳过（幂等） |
 | `run.bat --force` | 忽略幂等标记，强制再跑 |
+| `run.bat --sweep` | 补检：今天广告没满 `ad_target` 条就跑一轮，满了秒退（计划任务用这个） |
 | `run.bat --dry` | 只连接、打印界面文字、截图，不点击 |
 | `doctor.bat` | 7 项环境自检 |
 | `probe.bat` | 界面探测器：手动操作手机，实时刷出每页的文字与坐标 |
@@ -321,7 +338,7 @@ ping 223.5.5.5 / 119.29.29.29 / www.baidu.com（任一回包即算在线）
 ```
 logs\daily_<日期>.log          # 当天流水
 shots\<时分秒>_<标签>.png      # 每个关键节点都有截图
-state.json                    # {"last_success": "<日期>", ...}
+state.json                    # {"last_success": "<日期>", "ads_done": 2, "ads_date": "<日期>"}
 ```
 
 ---
@@ -334,6 +351,7 @@ state.json                    # {"last_success": "<日期>", ...}
 |---|---|---|
 | `package` | `com.mipay.wallet` | 小米钱包包名 |
 | `serial` | `""` | 只连一台就留空；多台时填 `adb devices` 里的序列号 |
+| `ad_target` | 3 | 当天要凑满的广告条数；`--sweep` 达到这个数就停止检查 |
 | `device_wait_seconds` | 120 | 等设备上线；超时中途会 `kill-server` 重试一次 |
 | `network_check` | true | 开跑前检查手机网络，断了自动重启 WiFi |
 | `network_retries` | 3 | 网络重试轮数，全部失败则退出（退出码 3） |

@@ -158,6 +158,8 @@ class WalletBot:
         self.inject = "shell"
         self.has_root = False
         self.ad_tasks_ok: bool | None = None
+        self.ads_done = 0          # 本次运行实际完成的广告条数（写回 state 累计）
+        self.sweep = False         # 补检模式：不等长冷却，交给下一轮补检
         self.net_ok: bool | None = None
         self._last_wake = 0.0
 
@@ -857,6 +859,12 @@ class WalletBot:
         # 09:22 冷启动后 0.4 秒就出现「再看10秒」。只重进一次就判定"今天做完了"
         # 会漏掉后面所有广告，所以必须按递增间隔多试几次。
         waits = step.get("page_reenter_waits") or [90, 300, 600]
+        if getattr(self, "sweep", False):
+            # 补检模式每 2 小时就再来一轮，没必要在单轮里干等十几分钟：
+            # 入口消失就先收工，下一轮补检自然会接住新下发的任务。
+            reenter_total = int(step.get("page_sweep_reenter", 1))
+            reenter_left = reenter_total
+            waits = step.get("page_sweep_waits") or [90]
         done = 0
         while done < rounds:
             hit = self.wait_ad_entry()
@@ -959,6 +967,7 @@ class WalletBot:
         if not self.open_task_panel():
             log("  任务面板打不开")
             self.shot("panel_missing")
+            self.ads_done = page_done
             if page_done:
                 log("  面板打不开，但活动页广告已完成 {} 次".format(page_done))
                 self.ad_tasks_ok = True
@@ -994,6 +1003,7 @@ class WalletBot:
                 if not self.open_task_panel():
                     log("  看完广告后回不到任务面板")
                     self.shot("panel_back_fail")
+                    self.ads_done = page_done + watched
                     self.ad_tasks_ok = False
                     return False
 
@@ -1002,6 +1012,7 @@ class WalletBot:
         if remaining:
             log("  仍存在广告任务，可能受限或文案不符: {}".format(remaining[0]))
             self.shot("ad_task_left")
+            self.ads_done = page_done + watched
             self.ad_tasks_ok = False
             return False
         if watched == 0 and page_done == 0:
@@ -1011,6 +1022,7 @@ class WalletBot:
             finished = (self.find_target("做任务 领时长")
                         or self.find_target("做任务 领会员")
                         or self.find_target("做任务 得时长"))
+            self.ads_done = page_done
             if finished:
                 log("  主按钮已是「做任务 …」，判定今日广告任务已全部完成")
                 self.ad_tasks_ok = True
@@ -1020,7 +1032,9 @@ class WalletBot:
             self.ad_tasks_ok = False
             return False
 
-        log("  本轮共处理 {} 个面板广告任务、{} 个页面广告".format(watched, page_done))
+        self.ads_done = page_done + watched
+        log("  本轮共处理 {} 个面板广告任务、{} 个页面广告（本次合计 {} 条）".format(
+            watched, page_done, self.ads_done))
         self.ad_tasks_ok = True
         return True
 
@@ -1538,6 +1552,8 @@ class WalletBot:
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--force", action="store_true", help="忽略当天已完成的标记")
+    parser.add_argument("--sweep", action="store_true",
+                        help="补检模式：今天广告还没做满 ad_target 条就再跑一轮，满了直接跳过")
     parser.add_argument("--dry", action="store_true", help="只连接并打印界面文本")
     args = parser.parse_args()
 
@@ -1548,15 +1564,31 @@ def main() -> int:
     HUMANIZE = bool(cfg["humanize"])
     log("=" * 60)
     log("开始执行，模式: {}，拟人化: {}".format(
-        "dry" if args.dry else "run", "开" if HUMANIZE else "关"))
+        "sweep" if args.sweep else ("dry" if args.dry else "run"),
+        "开" if HUMANIZE else "关"))
 
     state = read_state()
     today = dt.date.today().isoformat()
-    if cfg["skip_if_done"] and not args.force and state.get("last_success") == today:
-        log("今天已成功领取过（{}），跳过。用 --force 强制重跑。".format(today))
+    # 广告条数按天累计：广告是分批下发的，单轮做不完，
+    # 需要多轮补检才能凑满目标条数（见 ad_target）
+    target = int(cfg.get("ad_target", 3))
+    if state.get("ads_date") != today:
+        state["ads_date"] = today
+        state["ads_done"] = 0
+    ads_done = int(state.get("ads_done") or 0)
+
+    if args.sweep:
+        if ads_done >= target:
+            log("补检: 今日广告已做满 {}/{}，今天不再检查".format(ads_done, target))
+            return 0
+        log("补检: 今日广告 {}/{}，继续找剩下的 {} 条".format(
+            ads_done, target, target - ads_done))
+    elif cfg["skip_if_done"] and not args.force and state.get("last_success") == today:
+        log("今天已成功领取过（{}），跳过。用 --force / --sweep 强制重跑。".format(today))
         return 0
 
     bot = WalletBot(cfg)
+    bot.sweep = bool(args.sweep)
     if args.dry:
         try:
             bot.connect()
@@ -1611,12 +1643,20 @@ def main() -> int:
             nap(30)
 
     if success:
+        got = int(getattr(bot, "ads_done", 0) or 0)
+        state["ads_date"] = today
+        state["ads_done"] = ads_done + got
         state["last_success"] = today
         state["last_run"] = dt.datetime.now().isoformat(timespec="seconds")
         write_state(state)
         log("执行成功: {}".format(reason))
-        notify(cfg, "小米钱包每日领取成功", "{}\n时间: {}".format(
-            reason, dt.datetime.now().strftime("%Y-%m-%d %H:%M")))
+        log("今日广告进度: {}/{}（本次 {} 条）".format(
+            state["ads_done"], target, got))
+        if args.sweep and state["ads_done"] < target:
+            log("还没做满 {} 条，下一轮补检会继续找".format(target))
+        notify(cfg, "小米钱包每日领取成功", "{}\n时间: {}\n今日广告: {}/{}".format(
+            reason, dt.datetime.now().strftime("%Y-%m-%d %H:%M"),
+            state["ads_done"], target))
         return 0
 
     log("执行失败: {}".format(reason))
