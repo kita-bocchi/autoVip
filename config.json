@@ -92,7 +92,7 @@
     {
       "do": "trial_tasks",
       "desc": "逐个完成试用任务（下载→安装→试用30秒→领取）",
-      "rounds": 3,
+      "rounds": 8,
       "install_timeout": 420,
       "browse_seconds": 35,
       "dialog_timeout": 25,

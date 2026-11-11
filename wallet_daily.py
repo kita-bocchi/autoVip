@@ -1301,21 +1301,41 @@ class WalletBot:
                 continue
             log("  面板里没有可执行的试用任务")
             break
+        else:
+            # 循环跑满还没 break，说明还有活没干完（通常是"下载完等着去试用"）
+            log("  ⚠ 达到轮次上限 {}，可能还有未完成的试用任务（见下次截图）".format(rounds))
+            self.shot("trial_rounds_exhausted")
 
-        # 收尾：回到面板再领一次（试用完回来常直接变成「领取奖励」）
-        rows = self.panel_rows()
-        if not rows and (self.find_target("今日试用已完成")
-                         or self.find_target("明日再来可领")):
-            self.close_trial_hint()
-            nap(1.2)
-            self.open_task_panel()
+        # 收尾：把"刚下载完停在去试用"和"刚试完停在领取奖励"的行都走完。
+        # 原来这里只领「领取」，于是 11-11 那条下载完的「试用阿里巴巴30秒」
+        # 就一直停在「去试用」，2 天奖励当天白丢。
+        for _ in range(3):
             rows = self.panel_rows()
-        claim = next((r for r in rows if "领取" in r["btn"]), None)
-        if claim:
-            log("  收尾领奖: 「{}」".format(claim["title"][:10]))
-            self.tap(claim["x"], claim["y"])
-            nap(3.0)
-            handled += 1
+            if not rows and (self.find_target("今日试用已完成")
+                             or self.find_target("明日再来可领")):
+                self.close_trial_hint()
+                nap(1.2)
+                self.open_task_panel()
+                rows = self.panel_rows()
+            claim = next((r for r in rows if phase_of(r["btn"]) == "claim"
+                          and fresh(r, "claim")), None)
+            if claim:
+                log("  收尾领奖: 「{}」".format(claim["title"][:10]))
+                self.tap(claim["x"], claim["y"])
+                touched.add((claim["title"][:6], "claim"))
+                nap(3.0)
+                handled += 1
+                continue
+            launch = next((r for r in rows if phase_of(r["btn"]) == "launch"
+                           and fresh(r, "launch")), None)
+            if launch:
+                log("  收尾试用: 「{}」".format(launch["title"][:10]))
+                touched.add((launch["title"][:6], "launch"))
+                if self.trial_launch_and_browse(launch["title"], step):
+                    handled += 1
+                    self.open_task_panel()
+                    continue
+            break
 
         log("  试用任务共处理 {} 步".format(handled))
         self.shot("trial_done")
