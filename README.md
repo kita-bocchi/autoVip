@@ -165,16 +165,29 @@ setup_task.bat
 
 ```powershell
 $wd = (Resolve-Path .).Path
+# 注意：必须用 -Daily 作基础触发器，再把「每 2 小时 / 持续 12 小时」的重复挂上去。
+# 用 -Once 只能跑注册那一天，第二天 09:00 就不会再启动了（踩过这个坑）。
+$trig = New-ScheduledTaskTrigger -Daily -At 09:00
+$trig.Repetition = (New-ScheduledTaskTrigger -Once -At 09:00 `
+  -RepetitionInterval (New-TimeSpan -Minutes 120) `
+  -RepetitionDuration (New-TimeSpan -Hours 12)).Repetition
+$trig.RandomDelay = 'PT12M'
 Register-ScheduledTask -TaskName "XiaomiWalletDailyPM" `
   -Action (New-ScheduledTaskAction -Execute "$wd\.venv\Scripts\pythonw.exe" `
            -Argument ('"' + $wd + '\wallet_daily.py" --sweep') -WorkingDirectory $wd) `
-  -Trigger $((($t = New-ScheduledTaskTrigger -Once -At 09:00 `
-                -RepetitionInterval (New-TimeSpan -Minutes 120) `
-                -RepetitionDuration (New-TimeSpan -Hours 12)); $t.RandomDelay = 'PT12M'; $t)) `
+  -Trigger $trig `
   -Settings (New-ScheduledTaskSettingsSet -StartWhenAvailable -AllowStartIfOnBatteries `
              -DontStopIfGoingOnBatteries -ExecutionTimeLimit (New-TimeSpan -Hours 1) `
              -MultipleInstances IgnoreNew) -Force
 ```
+
+注册完**一定**要确认 `NextRunTime` 不是空的、而且落在今天：
+
+```powershell
+Get-ScheduledTask -TaskName "XiaomiWalletDailyPM" | Get-ScheduledTaskInfo | Select NextRunTime
+```
+
+`NextRunTime` 为空 = 触发器就是一次性的（只会跑注册当天），需要按上面的 `-Daily` 重建。
 
 `--sweep` 的判定完全靠 `state.json` 里的 `ads_done` / `ads_date`：
 今天做满 `ad_target`（默认 3）条就**秒退**，不连手机；没满就再跑一轮，只等 90 秒就收工

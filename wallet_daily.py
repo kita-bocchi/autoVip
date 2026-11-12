@@ -820,15 +820,50 @@ class WalletBot:
         if not hit:
             log("  桌面上找不到「钱包玩家视界」小组件，改走 App 内首页入口")
             return self.enter_from_app()
-        log("  点桌面小组件 @({},{})".format(hit[1], hit[2]))
-        self.tap(hit[1], hit[2])
+        tx, ty = self.widget_tap_point(hit[1], hit[2])
+        log("  点桌面小组件 @({},{})".format(tx, ty))
+        self.tap(tx, ty)
         for _ in range(12):
             nap(1.0)
             if self.current_package().startswith(self.cfg["package"]):
                 break
+        pkg = self.current_package()
+        if not pkg.startswith(self.cfg["package"]):
+            # 小组件节点覆盖整个卡片，中心点右侧是推广图（优酷等），
+            # 点偏了会直接跳到应用商店的下载页，整轮跑死在商店里。
+            log("  点小组件后跳到了 {}，退回桌面重试一次".format(pkg))
+            self.key("3")
+            nap(2.0)
+            tx, ty = self.widget_tap_point(hit[1], hit[2], force_safe=True)
+            log("  重试点小组件 @({},{})".format(tx, ty))
+            self.tap(tx, ty)
+            for _ in range(12):
+                nap(1.0)
+                if self.current_package().startswith(self.cfg["package"]):
+                    break
         nap(3.5)
         self.scroll_to_top(4)
         return self.on_activity_page()
+
+    def widget_tap_point(self, cx: int, cy: int, force_safe: bool = False) -> tuple[int, int]:
+        """算小组件的安全点击点
+
+        「钱包玩家视界」小组件是一个整块节点，bounds 覆盖左边信息区和右边的
+        推广图。直接点节点中心（=卡片正中）有一半机会点在推广图上，
+        实测会跳到应用商店的「优酷视频」下载页，之后找不到活动页入口、
+        任务面板也打不开，整轮直接失败。所以优先点左边的「去领会员」按钮，
+        找不到按钮节点就退到左下角，彻底避开右半边。
+        """
+        if not force_safe:
+            for kw in ("去领会员", "领取会员", "去会员中心", "查看会员"):
+                b = self._find_bounds(kw)
+                if b:
+                    return (b[0] + b[2]) // 2, (b[1] + b[3]) // 2
+        b = self._find_bounds("钱包玩家视界")
+        if b:
+            w, h = b[2] - b[0], b[3] - b[1]
+            return int(b[0] + w * 0.26), int(b[1] + h * 0.78)
+        return cx, cy
 
     def wait_ad_entry(self, tries: int = 4, delay: float = 2.0):
         """等首页大按钮重新出现
@@ -1367,6 +1402,29 @@ class WalletBot:
         # 读不到时多半是 WebView 把节点折叠了，唤醒后再试一次
         if self._wake_nodes():
             return self._find_target_once(keyword)
+        return None
+
+    def _find_bounds(self, keyword: str):
+        """按 text / content-desc 找节点，返回 (x1, y1, x2, y2)；找不到返回 None"""
+        safe = keyword.replace('"', "").replace("'", "")
+        if not safe:
+            return None
+        for attr in ("text", "content-desc"):
+            expr = '//*[contains(@{}, "{}")]'.format(attr, safe)
+            try:
+                elements = self.d.xpath(expr).all()
+            except Exception:
+                continue
+            for el in elements:
+                m = BOUNDS_RE.search(el.attrib.get("bounds", ""))
+                if not m:
+                    continue
+                x1, y1, x2, y2 = (int(v) for v in m.groups())
+                if x2 - x1 < 8 or y2 - y1 < 8:
+                    continue
+                if y2 <= 110 or y1 >= self.height - 40:
+                    continue
+                return x1, y1, x2, y2
         return None
 
     def _find_target_once(self, keyword: str) -> tuple[str, int, int] | None:
